@@ -7,23 +7,124 @@ import (
 	"io/ioutil"
 	"log"
 	"os"
+	"strings"
 	"os/signal"
 	"syscall"
 
 	"go-ari-library"
+	"database/sql"
+	_ "github.com/go-sql-driver/mysql"
+	// "github.com/coopernurse/gorp"
 )
 
+/* Voicemail Users
+id			(auto)
+mailbox 	(varchar)
+domain		(varchar)
+pin			(varchar)
+email		(varchar)
+first_name	(varchar)
+last_name	(varchar)
+*/
+
+/* Voicemail Messages
+id 		(auto)
+mailbox (varchar)
+domain	(varchar)
+folder	(varchar)
+timestamp	(date)
+read		(bool)
+recording_id	(varchar)
+*/
+
+/*	Voicemail Main
+authenticate:
+	voicemail_box
+	pin
+		check if valid
+		true: func(leave), goto(main)
+		false: decrement tries, goto(authenticate)
+
+main:
+	if new messages exist
+		true: play(you have new messages)
+		false: continue
+
+1: new messages
+2: change folders
+	0 new
+	1 old
+	2 work
+	3 family
+	4 friends
+	# cancel
+
+3: advanced options
+	4 outgoing call
+		enter message to call, then press pound, * to cancel
+	5 leave a message
+		1 extension
+		2 directory (won't implement)
+
+0: mailbox options
+	1 unavailable msg
+	2 busy msg
+	3 name
+	4 temporary greeting
+	5 password
+	* main menu
+*: help
+#: exit
+*/
+
+/* Voicemail
+Get mailbox
+Play unavailable / busy message
+	check if should play temporary greeting
+	if no message recorded, try name
+		if no name, play generic message
+
+Leave message
+	Record message
+	1 to accept this recording
+	2 to listen to it
+	3 to re-record this message
+	* help
+*/
+
 var (
-	config        Config
+	config			Config
+	db				*sql.DB
+	getMessages		*sql.Stmt
+	getGreeting		*sql.Stmt
+	insertNewMsg	*sql.Stmt 
 )
 
 type Config struct {
+	MySQLURL		string			`json:"mysql_url"`
 	Applications	[]string		`json:"applications"`
 	MessageBus		string			`json:"message_bus"`
 	BusConfig		interface{}		`json:"bus_config"`
 }
 
+type vmInternal struct {
+	Mailbox			string
+	Retries			int
+	ActivePlaybacks	[]string
+}
 
+func (v *vmInternal) AddPlayback(id string) {
+	v.ActivePlaybacks = append(v.ActivePlaybacks, id)
+}
+
+func (v *vmInternal) RemovePlayback(id string) {
+	for i := range v.ActivePlaybacks {
+		if v.ActivePlaybacks[i] == id {
+			v.ActivePlaybacks = append(v.ActivePlaybacks[:i], v.ActivePlaybacks[i+1:]...)
+			return
+		}
+	}
+}
 func init() {
 	var err error
 
@@ -37,20 +138,173 @@ func init() {
 
 	// read in the configuration file and unmarshal the json, storing it in 'config'
 	json.Unmarshal(configfile, &config)
+
+	db, err = sql.Open("mysql", config.MySQLURL)
+	if err != nil {
+		log.Fatal(err)
+	}
+	getMessages, err = db.Prepare("SELECT * FROM voicemail_messages WHERE mailbox=? AND folder=?")
+	if err != nil {
+		log.Fatal(err)
+	}
+	getGreeting, err = db.Prepare("SELECT recording_id FROM voicemail_messages WHERE mailbox=? AND folder=?")
+	if err != nil {
+		log.Fatal(err)
+	}
+	insertNewMsg, err = db.Prepare("INSERT INTO voicemail_messages values (NULL, ?, ?, 'New', NULL, 0, ?)")
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
-func startnvcApp(app string) {
-	fmt.Println("Started nvc app")
+// startVMMainApp starts the primary voicemail application for retrieving messages.
+func startVMMainApp(app string) {
+	return
+}
+
+// startVMApp starts the primary voicemail application for leaving messages.
+func startVMApp(app string) {
+	fmt.Printf("Started application: %s", app)
 	application := new(ari.App)
-	application.Init(app, nvcHandler)
+	application.Init(app, startVMHandler)
 	select {
 	case <- application.Stop:
 		return
 	}
-	
 }
-// ConsumeEvents pulls events off the channel and passes to the application.
-func nvcHandler(a *ari.AppInstance) {
+
+// New stuff that we need to figure out and clean up
+type vmstateFunc func(a *ari.AppInstance, vmState *vmInternal) (vmstateFunc, *vmInternal)
+
+// startVMHandler initializes a new voicemail application instance
+func startVMHandler(a *ari.AppInstance) {
+	v := new(vmInternal)
+	state, vmState := vmstartState(a, v)
+	for {
+		state, vmState = state(a, vmState)
+	}
+}
+
+func vmstartState(a *ari.AppInstance, vmState *vmInternal) (vmstateFunc, *vmInternal) {
+	select {
+	case event := <- a.Events:
+		switch event.Type {
+		case "StasisStart":
+			fmt.Println("Got start message")
+			var s ari.StasisStart
+			json.Unmarshal([]byte(event.ARI_Body), &s)
+			a.ChannelsAnswer(s.Channel.Id)
+			g := getGreetURI(s.Args[0], "unavailable")
+			fmt.Printf("Greeting URI is %s\n", g)
+			if strings.HasPrefix(g, "digits") {
+				fmt.Println("Has digits")
+				pb, _ := a.ChannelsPlay(s.Channel.Id, "sound:vm-theperson", "en")
+				vmState.AddPlayback(pb.Id)
+				pb, _ = a.ChannelsPlay(s.Channel.Id, g, "en")
+				vmState.AddPlayback(pb.Id)
+				pb, _ = a.ChannelsPlay(s.Channel.Id, "sound:vm-isunavail", "en")
+				vmState.AddPlayback(pb.Id)
+			} else {
+				a.ChannelsPlay(s.Channel.Id, g)
+			}
+
+			vmState.Mailbox = s.Args[0]
+			vmState.Retries = 0
+			//messageID := ari.UUID()
+			//a.ChannelsRecord(s.Channel.Id, messageID, "ulaw", "", "", "", "true")
+			return introPlayed, vmState
+		}
+	}
+	return vmstartState, vmState
+}
+
+func introPlayed(a *ari.AppInstance, vmState *vmInternal) (vmstateFunc, *vmInternal) {
+	select {
+	case event := <- a.Events:
+		switch event.Type {
+		case "PlaybackFinished":
+			var p ari.PlaybackFinished
+			json.Unmarshal([]byte(event.ARI_Body), &p)
+			fmt.Printf("Playback ID is %s\n", p.Playback.Id)
+			vmState.RemovePlayback(p.Playback.Id)
+			fmt.Printf("Active Playbacks is: %s\n", vmState.ActivePlaybacks)
+			if len(vmState.ActivePlaybacks) == 0 {
+				return leaveMessage, vmState
+			}
+			return introPlayed, vmState
+		case "ChannelDtmfReceived":
+			var c ari.ChannelDtmfReceived
+			json.Unmarshal([]byte(event.ARI_Body), &c)
+			switch c.Digit {
+			case "#":
+				for _, val := range vmState.ActivePlaybacks {
+					a.PlaybacksStop(val)
+					vmState.RemovePlayback(val)	
+				}
+				return leaveMessage, vmState
+			}
+		}
+	}
+	return introPlayed, vmState
+}
+func leaveMessage(a *ari.AppInstance, vmState *vmInternal) (vmstateFunc, *vmInternal) {
+	fmt.Println("entered leaveMessage")
+	select {
+	case event := <- a.Events:
+		//menuMaxTimesThrough := 3
+		switch event.Type {
+		case "ChannelDtmfReceived":
+			var c ari.ChannelDtmfReceived
+			fmt.Println("Got DTMF")
+			json.Unmarshal([]byte(event.ARI_Body), &c)
+			fmt.Printf("We got DTMF: %s\n", c.Digit)
+			switch c.Digit {
+			case "1":
+				//pb, _ := a.ChannelsPlay(c.Channel.Id, "sound:tt-monkeys", "en")
+				//pb, _ := a.ChannelsPlay(c.Channel.Id, "digits:1234567890", "en")
+				//pb, _ := a.ChannelsPlay(c.Channel.Id, "number:123890", "en")
+				//pb, _ := a.ChannelsPlay(c.Channel.Id, "characters:abcdefghijklmnop", "en")
+				pb, _ := a.ChannelsPlay(c.Channel.Id, "tone:congestion")
+				vmState.AddPlayback(pb.Id)
+				return leaveMessage, vmState
+			case "2":
+				for _, val := range vmState.ActivePlaybacks {
+					a.PlaybacksStop(val)
+					vmState.RemovePlayback(val)	
+				}
+				return leaveMessage, vmState
+			}
+		}
+	}
+	return leaveMessage, vmState
+}
+
+// getGreetURI returns the recording ID for the mailbox playback.
+// Returns a recording: <greetingID> if a recording URI is available.
+// Returns a digits: <mailbox> value if no recording was available.
+func getGreetURI(mailbox string, greetType string) string {
+	var greetingID string
+	db.Ping()
+	rows, err := getGreeting.Query(mailbox, greetType)
+	if err != nil {
+		fmt.Println(err)
+		return strings.Join([]string{"digits:", mailbox}, "")
+	}
+	for rows.Next() {
+		err = rows.Scan(&greetingID)
+		fmt.Printf("greetingID is %s\n", greetingID)
+		if err != nil || greetingID == "" {
+			return strings.Join([]string{"digits:", mailbox}, "")
+		}
+	}
+	if greetingID == "" {
+		return strings.Join([]string{"digits:", mailbox}, "")
+	}
+	return strings.Join([]string{"recording:", greetingID}, "")
+}
+
+// DEPRECATED: ConsumeEvents pulls events off the channel and passes to the application.
+func startAppHandler(a *ari.AppInstance) {
 	// this is where you would hand off the information to your application
 	for event := range a.Events {
 		fmt.Println("got event")
@@ -107,29 +361,17 @@ func signalCatcher() {
 func main() {
 	fmt.Println("Welcome to the go-ari-client")
 	ari.InitBus(config.MessageBus, config.BusConfig)
-	
+
 	for _, app := range config.Applications {
 		// create consumer that uses the inboundEvents and parses them onto the parsedEvents channel
-		
-		if app == "nvisible_control" {
-			go startnvcApp(app)
-		}
-
-	}
-
-	// TODO(leif): make this a go routine
-	// pull the events off the bus
-	// (brad): this is nsq-specific, needs to move there somehow
-	/*
-	for {
-		select {
-		case <-consumer.StopChan:
-			return
-		case <-sigChan:
-			consumer.Stop()
+		switch app {
+		case "voicemail":
+			go startVMApp(app)
+		case "voicemailmain":
+			go startVMMainApp(app)
 		}
 	}
-	*/
+
 	go signalCatcher()	// listen for os signal to stop the application
 	select{}
 }
