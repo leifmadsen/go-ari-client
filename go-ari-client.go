@@ -39,21 +39,52 @@ func init() {
 	json.Unmarshal(configfile, &config)
 }
 
-
+func startnvcApp(app string) {
+	fmt.Println("Started nvc app")
+	application := new(ari.App)
+	application.Init(app, nvcHandler)
+	select {
+	case <- application.Stop:
+		return
+	}
+	
+}
 // ConsumeEvents pulls events off the channel and passes to the application.
-func ConsumeEvents(a *ari.AppInstance) {
+func nvcHandler(a *ari.AppInstance) {
 	// this is where you would hand off the information to your application
 	for event := range a.Events {
 		fmt.Println("got event")
 		switch event.Type {
 		case "StasisStart":
+			var s ari.StasisStart
+			json.Unmarshal([]byte(event.ARI_Body), &s)
+			a.ChannelsAnswer(s.Channel.Id)
 			fmt.Println("Got start message")
 		case "ChannelDtmfReceived":
 			var c ari.ChannelDtmfReceived
 			fmt.Println("Got DTMF")
 			json.Unmarshal([]byte(event.ARI_Body), &c)
 			fmt.Printf("We got DTMF: %s\n", c.Digit)
-			a.ChannelPlay(c.Channel.Id, "sound:tt-monkeys", "en")
+			switch c.Digit {
+			case "1":
+				a.ChannelsPlay(c.Channel.Id, "sound:tt-monkeys", "en")
+			case "2":
+				a.ChannelsPlay(c.Channel.Id, "sound:tt-weasels")
+			case "3":
+				a.ChannelsPlay(c.Channel.Id, "sound:demo-congrats")
+			case "4":
+				err := a.MailboxesUpdate("1234@test", 0, 0)
+				if err != nil {
+					fmt.Println(err)
+				}
+			case "5":
+				m, err := a.MailboxesGet("1234@test")
+				if err != nil {
+					fmt.Println(err)
+				} else {
+					fmt.Printf("Mailbox info is: %v", m)
+				}
+			}
 		case "ChannelHangupRequest":
 			fmt.Println("Channel hung up")
 		case "StasisEnd":
@@ -75,18 +106,13 @@ func signalCatcher() {
 
 func main() {
 	fmt.Println("Welcome to the go-ari-client")
-
-	// listen for exit
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
+	ari.InitBus(config.MessageBus, config.BusConfig)
+	
 	for _, app := range config.Applications {
 		// create consumer that uses the inboundEvents and parses them onto the parsedEvents channel
-		application := new(ari.AppInstance)
 		
 		if app == "nvisible_control" {
-			go ConsumeEvents(application)
-			application.InitAppInstance(app, config.MessageBus, config.BusConfig)
+			go startnvcApp(app)
 		}
 
 	}
