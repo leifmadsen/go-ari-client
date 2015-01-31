@@ -41,9 +41,10 @@ func init() {
 
 
 // ConsumeEvents pulls events off the channel and passes to the application.
-func ConsumeEvents(events chan *ari.Event) {
+func ConsumeEvents(a *ari.AppInstance) {
 	// this is where you would hand off the information to your application
-	for event := range events {
+	for event := range a.Events {
+		fmt.Println("got event")
 		switch event.Type {
 		case "StasisStart":
 			fmt.Println("Got start message")
@@ -52,7 +53,7 @@ func ConsumeEvents(events chan *ari.Event) {
 			fmt.Println("Got DTMF")
 			json.Unmarshal([]byte(event.ARI_Body), &c)
 			fmt.Printf("We got DTMF: %s\n", c.Digit)
-			ari.ChannelPlay(c.Channel.Id, "sound:tt-monkeys", "en")
+			a.ChannelPlay(c.Channel.Id, "sound:tt-monkeys", "en")
 		case "ChannelHangupRequest":
 			fmt.Println("Channel hung up")
 		case "StasisEnd":
@@ -81,12 +82,11 @@ func main() {
 
 	for _, app := range config.Applications {
 		// create consumer that uses the inboundEvents and parses them onto the parsedEvents channel
-		fmt.Println(app)
-		fmt.Println(config.MessageBus)
-		fmt.Println(config.BusConfig)
-		parsedEvents := ari.InitConsumer(app, config.MessageBus, config.BusConfig)
+		application := new(ari.AppInstance)
+		
 		if app == "nvisible_control" {
-			go ConsumeEvents(parsedEvents)
+			go ConsumeEvents(application)
+			application.InitAppInstance(app, config.MessageBus, config.BusConfig)
 		}
 
 	}
