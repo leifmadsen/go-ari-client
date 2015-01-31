@@ -60,14 +60,14 @@ func GenHandler() (func(*nsq.Message) error, chan []byte) {
 	}, in
 }
 
-func PublishCommand(channel string, command *nv.NV_Command, p *nsq.Producer) {
+func PublishCommand(channel string, command *ari.Command, p *nsq.Producer) {
 	busMessage, _ := json.Marshal(command)
 
 	fmt.Printf("[DEBUG] Bus Data for %s:\n%s", channel, busMessage)
 	p.Publish(channel, []byte(busMessage))
 }
 
-func ConsumeEvents(events chan *nv.NV_Event) {
+func ConsumeEvents(events chan *ari.Event) {
 	for event := range events {
 		switch event.Type {
 		case "StasisStart":
@@ -126,22 +126,22 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = consumer.ConnectToNSQLookupds(config.LookupdHttpAddress)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	// generate a handler for processing inbound events
 	processEvent, inboundEvents := GenHandler()
 
 	// process events as they come off the bus
 	consumer.AddHandler(nsq.HandlerFunc(processEvent))
+	err = consumer.ConnectToNSQLookupds(config.LookupdHttpAddress)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// create channel to place parsed events onto
-	parsedEvents := make(chan *nv.NV_Event)
+	parsedEvents := make(chan *ari.Event)
 
 	// create consumer that uses the inboundEvents and parses them onto the parsedEvents channel
-	nv.InitConsumer(inboundEvents, parsedEvents)
+	ari.InitConsumer(inboundEvents, parsedEvents)
 
 	// start consuming the parsed events
 	go ConsumeEvents(parsedEvents)
